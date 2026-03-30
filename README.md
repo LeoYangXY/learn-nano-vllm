@@ -26,9 +26,7 @@ pip install git+https://github.com/GeeeekExplorer/nano-vllm.git
 
 To download the model weights manually, use the following command:
 ```bash
-huggingface-cli download --resume-download Qwen/Qwen3-0.6B \
-  --local-dir ~/huggingface/Qwen3-0.6B/ \
-  --local-dir-use-symlinks False
+python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='Qwen/Qwen3-0.6B', local_dir='./models/huggingface/Qwen3-0.6B/', local_dir_use_symlinks=False, repo_type='model')"
 ```
 
 ## Quick Start

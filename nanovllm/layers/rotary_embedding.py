@@ -1,4 +1,3 @@
-from functools import lru_cache
 import torch
 from torch import nn
 
@@ -48,7 +47,9 @@ class RotaryEmbedding(nn.Module):
         return query, key
 
 
-@lru_cache(1)
+_ROPE_CACHE: dict[tuple[int, int, int, float, tuple | None], RotaryEmbedding] = {}
+
+
 def get_rope(
     head_size: int,
     rotary_dim: int,
@@ -56,6 +57,14 @@ def get_rope(
     base: float,
     rope_scaling: dict | None = None,
 ):
-    assert rope_scaling is None
-    rotary_emb = RotaryEmbedding(head_size, rotary_dim, max_position, base)
-    return rotary_emb
+    if rope_scaling is None:
+        scaling_key = None
+    else:
+        scaling_key = tuple(sorted(rope_scaling.items()))
+
+    key = (head_size, rotary_dim, max_position, float(base), scaling_key)
+    if key not in _ROPE_CACHE:
+        # Current implementation only supports default RoPE behavior.
+        # Keep runtime compatible even when newer HF configs include rope_scaling.
+        _ROPE_CACHE[key] = RotaryEmbedding(head_size, rotary_dim, max_position, base)
+    return _ROPE_CACHE[key]
