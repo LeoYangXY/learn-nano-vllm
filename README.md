@@ -19,7 +19,35 @@ A lightweight vLLM implementation built from scratch.
 ## Installation
 
 ```bash
-pip install git+https://github.com/GeeeekExplorer/nano-vllm.git
+# B. 稳定复现环境（推荐）
+conda create -n nano-vllm-cu12 python=3.10 -y
+conda activate nano-vllm-cu12
+
+python -m pip install -U pip setuptools wheel packaging ninja
+python -m pip install --index-url https://download.pytorch.org/whl/cu121 \
+  torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1
+python -m pip install triton==3.1.0
+
+export CUDA_HOME=/usr/local/cuda-12.2
+export MAX_JOBS=8
+python -m pip install --no-build-isolation flash-attn==2.7.4.post1
+
+cd /home/leo/nano-vllm
+python -m pip install -e .
+
+python - <<'PY'
+import torch
+print("torch:", torch.__version__, "cuda:", torch.version.cuda, "avail:", torch.cuda.is_available())
+import flash_attn
+print("flash_attn:", getattr(flash_attn, "__version__", "unknown"))
+PY
+
+python ./example.py
+```
+
+
+```bash
+# pip install git+https://github.com/GeeeekExplorer/nano-vllm.git
 ```
 
 ## Model Download
