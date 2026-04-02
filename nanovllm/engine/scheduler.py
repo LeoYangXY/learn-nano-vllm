@@ -1,3 +1,40 @@
+"""
+Scheduler —— 请求调度器
+=========================
+
+整体职责：
+----------
+决定"这一个 step，哪些 Sequence 能上 GPU、上 GPU 跑 prefill 还是 decode、
+谁要被抢占让出 KV cache 显存块"。它是整个 engine 里唯一知道"系统当前状态"
+的人（谁在排队、谁在跑、谁缓存命中了多少）。
+
+核心数据：
+----------
+- self.waiting: deque[Sequence]   —— 等待被首次调度跑 prefill 的请求队列。
+- self.running: deque[Sequence]   —— 已经 prefill 完、正在逐 token decode 的请求队列。
+- self.block_manager: BlockManager —— 物理 KV block 池，负责 allocate / free / prefix hit。
+
+schedule() 返回什么：
+--------------------
+返回 (seqs, is_prefill)：
+  - 如果 waiting 里有可以跑的请求 → 本 step 做 prefill，返回一批 waiting 里的 seq；
+  - 否则从 running 里拿出能继续 decode 的 seq，返回一批 running 里的 seq。
+
+  这是 vLLM v0 的"二选一"模型 —— 同一个 step **要么 prefill 要么 decode，不混批**。
+  这也是为什么长 prefill 会把 decode 卡死（head-of-line blocking，见 docs/principles.md §2）。
+  Phase 1 会把这里改成 **chunked prefill 混批**。
+
+两个关键 budget：
+-----------------
+- max_num_seqs            —— 并发 seq 上限（控制 batch size）。
+- max_num_batched_tokens  —— 单 step 处理的 token 总数上限（控制 compute 量）。
+
+抢占（preempt）：
+-----------------
+decode 阶段某个 seq 要写 KV 但 block 池空了 → 把 running 队尾的倒霉蛋
+踢回 waiting 并释放其 block，让当前 seq 继续跑。被抢占的 seq 下次从
+prefill 状态重跑（Phase 3 会做 SLO-aware 的优先级抢占）。
+"""
 from collections import deque
 
 from nanovllm.config import Config

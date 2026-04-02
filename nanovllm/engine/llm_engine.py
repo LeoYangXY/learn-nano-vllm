@@ -1,3 +1,44 @@
+"""
+LLMEngine —— 推理引擎顶层入口
+===============================
+
+一句话：把 "一堆 prompt + sampling_params" 变成 "一堆生成的 token_ids"，
+       其间协调 Scheduler（谁该上）+ ModelRunner（怎么跑）+ BlockManager（KV 在哪）。
+
+调用链（见 generate()）：
+-------------------------
+    for prompt in prompts:
+        add_request(prompt, sp)          # 编码 + 构造 Sequence + 入 waiting
+    while not is_finished():
+        outputs, n = step()              # 一个迭代步
+        更新进度条
+    收集 outputs 并 decode 成 str
+
+一个 step 做什么（最核心的 3 行）：
+----------------------------------
+    seqs, is_prefill = self.scheduler.schedule()       # 决定这一步谁跑、跑啥
+    token_ids = self.model_runner.call("run", seqs, is_prefill)  # GPU forward + sampling
+    self.scheduler.postprocess(seqs, token_ids)        # 把新 token 追加到 seq、判定 finished
+
+进程模型（Tensor Parallel）：
+-----------------------------
+tensor_parallel_size > 1 时：
+  - 主进程持有 rank=0 的 ModelRunner（直接调用）；
+  - spawn 出 rank=1..(TP-1) 的子进程，每个子进程也跑一份 ModelRunner，但进入 loop()
+    阻塞在 SharedMemory 上等任务；
+  - 主进程每次 call() 会通过 SharedMemory + mp.Event 广播任务到所有 rank，
+    然后本地也跑一份；
+  - NCCL all-reduce 发生在模型内部（RowParallelLinear），和任务分发解耦。
+
+这个设计的妙处：把"控制流广播"（轻量 pickle）和"数据流同步"（NCCL）分开，
+控制流不占 GPU 流，降低同步开销。
+
+生命周期：
+----------
+atexit 注册 exit()，Python 解释器退出时自动通知所有子进程 exit，
+然后主进程 join 等子进程退出，防止僵尸进程。
+"""
+
 import atexit
 from dataclasses import fields
 from time import perf_counter

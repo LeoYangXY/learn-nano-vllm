@@ -1,3 +1,48 @@
+"""
+ModelRunner —— 模型执行器
+============================
+
+整体职责：
+----------
+把 Scheduler 决定好的一批 Sequence 转成 GPU 张量 → 跑一遍模型 forward → 采样
+→ 返回 token_ids。它是"engine 的 host 侧" 和 "GPU 的 device 侧" 之间的唯一桥梁。
+
+三大阶段（每个 step 内）：
+--------------------------
+1. prepare_prefill / prepare_decode
+   把一批 Sequence 的 token_ids、positions、slot_mapping、block_tables 拼成连续的
+   GPU tensor。Prefill 用 varlen 拼接（cu_seqlens_q/k），decode 直接 batch 起来。
+   同时通过 set_context() 把这些"元信息"挂到全局 Context，让 Attention 层直接读。
+
+2. run_model
+   - Prefill 或者 batch 很大（>512）：直接跑 eager 模式的 model(...) forward；
+   - Decode 且开了 CUDA Graph：把 input 写进 graph_vars 的占位 tensor，graph.replay()
+     代替实际 forward，把 kernel launch 开销从 O(n_kernels) 降到 O(1)。
+
+3. sampler
+   只在 rank=0 跑（省通信），产出最终 token_ids。
+
+多卡协同（TP）：
+----------------
+world_size > 1 时：
+- rank=0 是"主 worker"，直接被 LLMEngine 调用；
+- rank>0 是"从 worker"，开 daemon 进程在 loop() 里等 SharedMemory 下发任务；
+- 任务通过 pickle → SharedMemory → pickle 传递（比 NCCL scatter 轻量）；
+- 模型前向内部的 all-reduce 走 NCCL（在 linear.RowParallelLinear 里）。
+
+KV cache 布局：
+---------------
+self.kv_cache: shape = [2, num_layers, num_blocks, block_size, num_kv_heads, head_dim]
+  - 第 0 维：0=K, 1=V；
+  - 预先一次性分配（allocate_kv_cache），分 slice 挂到每个 Attention 层的 k_cache/v_cache；
+  - 所有 seq 的 KV 都寄存在这一大块显存里，靠 block_table + slot_mapping 做索引。
+
+CUDA Graph（见 docs/principles.md §5）：
+-----------------------------------------
+在启动时按 batch_size 档位（1,2,4,8,16,32,...,max_bs）预先录图，
+运行时根据 bs 选最近档位 replay。graph_vars 是 replay 时共用的占位 tensor，
+每次 replay 前把最新数据 copy 进去即可（不能变 shape / dtype / 地址）。
+"""
 import pickle
 import torch
 import torch.distributed as dist

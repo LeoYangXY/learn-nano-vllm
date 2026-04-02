@@ -1,3 +1,37 @@
+"""
+Sequence —— 一次推理请求的完整状态载体
+========================================
+
+每个用户发来的 prompt 在 engine 内部都会被 wrap 成一个 Sequence 对象，
+它是 Scheduler / BlockManager / ModelRunner 三者之间流通的唯一实体。
+
+这个类既存 **数据**（已生成的 token）、又存 **元数据**（block_table、cached 长度、
+sampling 参数、状态机）。改这个类要特别小心，因为它会穿过：
+- 主进程（Scheduler 看到完整版）；
+- 子进程（TP worker 只看到 __getstate__ 瘦身后的版本，只保留必要字段避免每步序列化开销）。
+
+状态机：
+--------
+    WAITING  ──(schedule 首次入场)──> RUNNING ──(生成 EOS / 达到 max_tokens)──> FINISHED
+       ^                                  │
+       └─────────(被 preempt 抢占)────────┘
+
+关键字段：
+----------
+- token_ids                 已经存在的所有 token（prompt + 已生成）。
+- num_prompt_tokens         初始 prompt 长度（不变）。
+- num_cached_tokens         已命中 prefix cache 的 token 数（prefill 时从这个位置开始算）。
+- block_table               逻辑块 idx → 物理 block_id 的映射，list[int]。
+- last_token                最近生成的 token，用于 decode 阶段作为 next-step 输入。
+
+Phase 1 会加：
+- num_prompt_processed      当前 prompt 已经 prefill 了多少 token（chunked prefill 专用）。
+- chunk_size                本请求允许的最大 chunk 大小。
+Phase 3 会加：
+- priority, arrival_time, deadline, tenant_id  （SLO-aware 调度）。
+Phase 4 会加：
+- lora_id                   （multi-LoRA 路由）。
+"""
 from copy import copy
 from enum import Enum, auto
 from itertools import count

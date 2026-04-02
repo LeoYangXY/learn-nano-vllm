@@ -1,3 +1,42 @@
+"""
+BlockManager —— KV cache 物理块管理器（Paged Attention 的底座）
+==================================================================
+
+核心思想（Paged Attention）：
+-------------------------------
+传统连续 KV cache：每个 Sequence 预分配 [max_seq_len, num_layers, heads, dim] 的
+连续显存 —— 绝大多数 token 没用到时就是浪费。
+Paged Attention：把 KV 切成固定大小 block（这里是 256 token/block），
+每个 Sequence 持有一个 **block_table**（逻辑块 → 物理块编号的映射）。
+物理块按需分配、按需释放，显存利用率接近 100%。
+
+这里多干的一件事：Prefix Caching（见 docs/principles.md §1）
+-----------------------------------------------------------------
+每个物理块上还挂了：
+  - hash：由 `(prev_block_hash, token_ids)` 计算出来的链式哈希；
+  - token_ids：这块里的原始 token 序列，用于哈希冲突兜底校验。
+
+配合一个全局 `hash_to_block_id` dict，新请求来的时候会逐块算 hash 去查：
+  - 命中且 token_ids 一致 → 复用（可能 ref_count++，也可能从 free 池"认领"回来）；
+  - 没命中 / hash 冲突 → 分配新 block，GPU 那边算完再把 KV 写进去。
+
+关键不变量：
+-------------
+1. block.ref_count == 0  ↔  block_id ∈ free_block_ids（互斥）
+2. 活跃 block 的 hash 非 -1 时，必定能在 hash_to_block_id 里找到自己
+3. 最后一个 block 可能是"半满"的（token 数 < block_size），此时 hash = -1
+   —— 因为半满块内容还会变，不适合被别的 req 复用。
+
+与其他组件的交互：
+--------------------
+- Scheduler.schedule() 调 can_allocate / allocate（prefill 入场）
+- Scheduler.schedule() 调 can_append / may_append（decode 新写一个 token）
+- Scheduler.postprocess() 在 seq finished 时调 deallocate
+- ModelRunner.prepare_prefill/decode 用 seq.block_table 构造 slot_mapping
+- Attention kernel 用 slot_mapping 知道 KV 写到哪、用 block_tables 知道 KV 读哪里
+
+Phase 5 将替换为 Radix Trie 版本，支持 token 级（不是块级）partial prefix 匹配。
+"""
 from collections import deque
 import xxhash
 import numpy as np
