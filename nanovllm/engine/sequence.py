@@ -24,13 +24,6 @@ sampling 参数、状态机）。改这个类要特别小心，因为它会穿�
 - block_table               逻辑块 idx → 物理 block_id 的映射，list[int]。
 - last_token                最近生成的 token，用于 decode 阶段作为 next-step 输入。
 
-Phase 1 会加：
-- num_prompt_processed      当前 prompt 已经 prefill 了多少 token（chunked prefill 专用）。
-- chunk_size                本请求允许的最大 chunk 大小。
-Phase 3 会加：
-- priority, arrival_time, deadline, tenant_id  （SLO-aware 调度）。
-Phase 4 会加：
-- lora_id                   （multi-LoRA 路由）。
 """
 from copy import copy
 from enum import Enum, auto
@@ -64,8 +57,7 @@ class Sequence:
         # 只包含 prompt 部分，不包括后续生成的 token。
         self.num_prompt_tokens = len(token_ids)
 
-        # kvcache已缓存的token数目
-        self.num_cached_tokens = 0
+        self.num_cached_tokens = 0 #已命中 prefix cache 的 token 数（prefill 从这里之后才开始算）
 
 
         # 在大模型推理时，KV cache（注意力的 key/value 缓存）通常会被分成很多小块（block），每个 block 存储一段 token 的 KV 信息（比如 256 个 token）。

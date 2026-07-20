@@ -10,7 +10,7 @@ Paged Attention：把 KV 切成固定大小 block（这里是 256 token/block）
 每个 Sequence 持有一个 **block_table**（逻辑块 → 物理块编号的映射）。
 物理块按需分配、按需释放，显存利用率接近 100%。
 
-这里多干的一件事：Prefix Caching（见 docs/principles.md §1）
+这里多干的一件事：Prefix Caching
 -----------------------------------------------------------------
 每个物理块上还挂了：
   - hash：由 `(prev_block_hash, token_ids)` 计算出来的链式哈希；
