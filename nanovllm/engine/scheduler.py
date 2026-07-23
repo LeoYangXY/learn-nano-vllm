@@ -1,5 +1,6 @@
 """
 Scheduler —— 请求调度器
+没有做chunked prefill
 =========================
 
 整体职责：
@@ -34,6 +35,31 @@ schedule() 返回什么：
 decode 阶段某个 seq 要写 KV 但 block 池空了 → 把 running 队尾的倒霉蛋
 踢回 waiting 并释放其 block，让当前 seq 继续跑。被抢占的 seq 下次从
 prefill 状态重跑（Phase 3 会做 SLO-aware 的优先级抢占）。
+
+Sequence 状态机：
+----------------
+每个 Sequence 在其一生中会在这三种状态间流转：
+
+    status    含义                                        在哪个队列       由谁设置
+    ────────  ──────────────────────────────────────────  ──────────────  ────────────────────────────────
+    WAITING   还没首次调度，等着跑 prefill（或被抢占后       self.waiting    初始 add() 进 waiting；preempt() 也设成 WAITING
+              回退到这里重跑）
+    RUNNING   已经 prefill 完、正在逐 token decode          self.running    prefill 段 allocate 后设成 RUNNING
+    FINISHED  生成到 EOS 或 max_tokens，彻底结束，          不在任何队列     postprocess() 里设
+              释放 block 出队
+
+流转路径：
+    add() ──> WAITING (在 waiting 队列)
+       │
+    schedule() prefill 段:  allocate + status=RUNNING, 移到 running
+       │
+       ▼
+    RUNNING (在 running 队列，每 step decode 一 token)
+       │
+       ├─ 资源不够时被 preempt:  status=WAITING, deallocate, 放回 waiting 头部
+       │       → 下次从 prefill 重跑（注意：缓存命中的部分能复用，不用全重算）
+       │
+       └─ postprocess():  遇到 EOS 或达到 max_tokens → status=FINISHED, deallocate, 从 running 移除
 """
 from collections import deque
 
@@ -58,17 +84,18 @@ class Scheduler:
     def add(self, seq: Sequence):
         self.waiting.append(seq)
 
+    #一个 step 里，要么从 waiting 里尽量多拉一批（最多到预算上限）去跑 prefill，要么从 running 里尽量多取一批（最多到并发上限）各推进一步 decode。二选一，且两种都只跑"预算内的子集"，不会一次清空队列。
     def schedule(self) -> tuple[list[Sequence], bool]:
         # prefill
         scheduled_seqs = []
         num_seqs = 0
-        num_batched_tokens = 0
+        num_batched_tokens = 0 #它是 schedule() 里本 step 计划送进 GPU 计算的 token 总数预算计数器，用来卡住 max_num_batched_tokens 这条上限。如果一个block已经可以复用了，那么它就不需要被送到gpu里面去计算
         while self.waiting and num_seqs < self.max_num_seqs:
             seq = self.waiting[0]
             if num_batched_tokens + len(seq) > self.max_num_batched_tokens or not self.block_manager.can_allocate(seq):
                 break
             num_seqs += 1
-            self.block_manager.allocate(seq)
+            self.block_manager.allocate(seq) #给这条 seq 分配/复用物理块（含 prefix cache 命中逻辑）
             num_batched_tokens += len(seq) - seq.num_cached_tokens
             seq.status = SequenceStatus.RUNNING
             self.waiting.popleft()
@@ -103,12 +130,13 @@ class Scheduler:
         self.running.extendleft(reversed(scheduled_seqs))
         return scheduled_seqs, False
 
-    #用于抢占资源
+    #用于抢占资源，把 seq 从 running 队列中移除，释放其 block，然后把 seq 放回 waiting 队列头部。
     def preempt(self, seq: Sequence):
         seq.status = SequenceStatus.WAITING
         self.block_manager.deallocate(seq)
         self.waiting.appendleft(seq)
 
+    #postprocess 是 GPU 跑完一个 step、拿到生成结果之后的"收尾 + 判定"函数。它做两件事：把模型刚生成的 token 写回每个 seq，并判断这条 seq 是否该结束了
     def postprocess(self, seqs: list[Sequence], token_ids: list[int]) -> list[bool]:
         for seq, token_id in zip(seqs, token_ids):
             seq.append_token(token_id)
