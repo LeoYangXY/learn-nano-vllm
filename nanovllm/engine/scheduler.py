@@ -84,7 +84,40 @@ class Scheduler:
     def add(self, seq: Sequence):
         self.waiting.append(seq)
 
-    #一个 step 里，要么从 waiting 里尽量多拉一批（最多到预算上限）去跑 prefill，要么从 running 里尽量多取一批（最多到并发上限）各推进一步 decode。二选一，且两种都只跑"预算内的子集"，不会一次清空队列。
+    # ---------------------------------------------------------------------------
+    # 一个 step 里，要么从 waiting 里尽量多拉一批（最多到预算上限）去跑 prefill，
+    # 要么从 running 里尽量多取一批（最多到并发上限）各推进一步 decode。
+    # 二选一，且两种都只跑"预算内的子集"，不会一次清空队列。
+    #
+    # 具体举例（假设每步最多取 20 个 prefill 和 50 个 decode，共有 100 个 sequence 在 waiting；
+    #
+    # 【prefill 阶段】waiting 非空时优先、连续地做 prefill，但每步只拉预算内一批：
+    #   step0: 取 20 个 prefill → waiting 剩 80，running +20
+    #   step1: 取 20 个 prefill → waiting 剩 60，running +20
+    #   step2: 取 20 个 prefill → waiting 剩 40，running +20
+    #   step3: 取 20 个 prefill → waiting 剩 20，running +20
+    #   step4: 取 20 个 prefill → waiting 空，   running = 100
+    #   step5: waiting 空了 → 进 decode 分支
+    #   原因：prefill 分支 self.waiting.popleft() 后 self.running.append(seq)（加到队尾），
+    #         不会回退，顺序把 waiting 吃干净。
+    #
+    # 【decode 阶段】每步每 seq 只 +1 token，且 extendleft 会把本轮 seq 放回队头：
+    #   假设 decode 上限 50、running 里有 100 个（前 50 在队头、后 50 在队尾）：
+    #   step5 : popleft 取前50 → decode(各+1 token) → extendleft 放回队头
+    #   step6 : popleft 取的还是那前50（后50仍在队尾没动） → decode
+    #   step7 : 又是前50 ...
+    #   ...   : 只要前50没 finish，后50永远排不到 → starvation（饿死）
+    #   后 50 个要能动，必须等前 50 里某些生成到 EOS / max_tokens，
+    #   被 postprocess 从 running 移除释放位置，后 50 才往前挪、被轮到。
+    #
+    #   真实时间线（假设上限 50、前 50 每条要生成 256 token 才停）：
+    #   step5      : 前50 各 +1 token (累计1)，后50 没动
+    #   step6      : 前50 各 +1 token (累计2)，后50 没动
+    #   ...
+    #   一直到某一步，有 seq 生成到了max token num了，或者生成到了eos，那么它会退出，让后续的sequence加一个进入running
+    #   ...
+    #   直到后50也生成完 → is_finished() 为真，退出
+    # ---------------------------------------------------------------------------
     def schedule(self) -> tuple[list[Sequence], bool]:
         # prefill
         scheduled_seqs = []
